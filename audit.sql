@@ -9,6 +9,10 @@
 -- and a row_key has been added to the log, for a key back to the audited table row
 
 --
+-- Elfotec changes: added tenant_id column to the audit table and to the index.
+--
+
+--
 -- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
 --
 --    http://schinckel.net/2014/09/29/adding-json%28b%29-operators-to-postgresql/
@@ -38,12 +42,12 @@ AS $function$
     END
 $function$;
 
-DROP OPERATOR IF EXISTS - (jsonb, text[]);
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = text[],
-  PROCEDURE = jsonb_minus
-);
+-- DROP OPERATOR - (jsonb, text[]);
+-- CREATE OPERATOR - (
+--   LEFTARG = jsonb,
+--   RIGHTARG = text[],
+--   PROCEDURE = jsonb_minus
+-- );
 
 
 --
@@ -81,12 +85,12 @@ AS $$
 
 $$ LANGUAGE SQL;
 
-DROP OPERATOR IF EXISTS - (jsonb, jsonb);
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = jsonb,
-  PROCEDURE = jsonb_minus
-);
+-- DROP OPERATOR - (jsonb, jsonb);
+-- CREATE OPERATOR - (
+--   LEFTARG = jsonb,
+--   RIGHTARG = jsonb,
+--   PROCEDURE = jsonb_minus
+-- );
 
 
 CREATE SCHEMA audit;
@@ -123,6 +127,7 @@ CREATE TABLE audit.log (
     transaction_id bigint,
     application_name text,
     application_user text,
+    tenant_id bigint,
     client_addr inet,
     client_port integer,
     client_query text,
@@ -149,16 +154,18 @@ COMMENT ON COLUMN audit.log.client_addr IS 'IP address of client that issued que
 COMMENT ON COLUMN audit.log.client_port IS 'Remote peer IP port address of client that issued query. Undefined for unix socket.';
 COMMENT ON COLUMN audit.log.client_query IS 'Top-level query that caused this auditable event. May be more than one statement.';
 COMMENT ON COLUMN audit.log.application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.application_user IS 'Application user set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.tenant_id IS 'Tenant ID set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
-COMMENT ON COLUMN audit.log.original IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
-COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
+COMMENT ON COLUMN audit.log.original IS 'Record value. Null for statement-level trigger. For INSERT this tuple is empty. For DELETE and UPDATE it is the old tuple.';
+COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by INSERT and UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
-CREATE INDEX log_schema_name_table_name_row_key_action_tstamp_tx_idx
-    ON audit.log (schema_name, table_name, row_key, action_tstamp_tx DESC);
+CREATE INDEX log_schema_name_table_name_tenant_row_key_action_tstamp_tx_idx
+    ON audit.log (schema_name, table_name, row_key, tenant_id, action_tstamp_tx DESC);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
@@ -186,6 +193,7 @@ BEGIN
         txid_current(),                               -- transaction ID
         current_setting('application.name', 't'),          -- client application
         current_setting('application.user', 't'),          -- client user
+        current_setting('tenant_id', 't'),                 -- tenant ID
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
@@ -213,8 +221,8 @@ BEGIN
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_old - excluded_cols;
-        audit_row.diff = (jsonb_new - audit_row.original) - excluded_cols;
+        audit_row.original = jsonb_minus(jsonb_old, excluded_cols);
+        audit_row.diff = jsonb_minus(jsonb_minus(jsonb_new, audit_row.original), excluded_cols);
         IF audit_row.diff = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
@@ -224,13 +232,13 @@ BEGIN
         IF jsonb_old ? row_key_col THEN
             audit_row.row_key = jsonb_old ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_old - excluded_cols;
+        audit_row.original = jsonb_minus(jsonb_old, excluded_cols);
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         jsonb_new = to_jsonb(NEW.*);
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_new - excluded_cols;
+        audit_row.diff = jsonb_minus(jsonb_new, excluded_cols);
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
@@ -355,4 +363,17 @@ $body$ LANGUAGE 'sql';
 
 COMMENT ON FUNCTION audit.audit_table(regclass) IS $body$
 Add auditing support to the given table. Row-level changes will be logged with full client query text. No cols are ignored.
+$body$;
+
+-- view
+
+CREATE OR REPLACE VIEW audit.tableslist AS 
+ SELECT DISTINCT triggers.trigger_schema AS schema,
+    triggers.event_object_table AS auditedtable
+   FROM information_schema.triggers
+    WHERE triggers.trigger_name::text IN ('audit_trigger_row'::text, 'audit_trigger_stm'::text)  
+ORDER BY schema, auditedtable;
+
+COMMENT ON VIEW audit.tableslist IS $body$
+View showing all tables with auditing set up. Ordered by schema, then table.
 $body$;

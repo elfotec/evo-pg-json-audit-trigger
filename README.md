@@ -18,6 +18,10 @@ Requires PostgreSQL 9.5+
 
 ----
 
+## Elfotec changes
+
+   * Added "tenant_id" field
+
 ## More info about changes for row_key
 * a key value from the audited row is stored in the row_key column of the log table as text
 * the source column is configurable and defaults to 'id'
