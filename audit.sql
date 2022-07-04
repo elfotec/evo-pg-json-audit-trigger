@@ -9,8 +9,20 @@
 -- and a row_key has been added to the log, for a key back to the audited table row
 
 --
--- Elfotec changes: added tenant_id column to the audit table and to the index.
+-- Elfotec changes: 
+--    added tenant_id column to the audit table and to the index.
+--    changed index adding tenant_id column
+--    removed useless indexes
+--    added partition by tenant_id for log table 
+--    only logs old not null values
+--    keep all objects only in "audit" schema
+--    do not recreate minus ("-") operator for json fields
 --
+
+CREATE SCHEMA audit;
+REVOKE ALL ON SCHEMA audit FROM public;
+COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
+
 
 --
 -- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
@@ -20,7 +32,7 @@
 -- param 0: JSONB, source JSONB document to remove keys from
 -- param 1: text[], keys to remove from the JSONB document
 --
-CREATE OR REPLACE FUNCTION "jsonb_minus"(
+CREATE OR REPLACE FUNCTION audit."jsonb_minus"(
   "json" jsonb,
   "keys" TEXT[]
 )
@@ -58,7 +70,7 @@ $function$;
 -- param 0: JSONB, primary JSONB source document to compare
 -- param 1: JSONB, secondary JSONB source document to compare
 --
-CREATE OR REPLACE FUNCTION jsonb_minus ( arg1 jsonb, arg2 jsonb )
+CREATE OR REPLACE FUNCTION audit.jsonb_minus ( arg1 jsonb, arg2 jsonb )
 RETURNS jsonb
 AS $$
 
@@ -70,7 +82,7 @@ AS $$
           -- if the value is an object and the value of the second argument is
           -- not null, we do a recursion
           WHEN jsonb_typeof(value) = 'object' AND arg2 -> key IS NOT NULL
-          THEN jsonb_minus(value, arg2 -> key)
+          THEN audit.jsonb_minus(value, arg2 -> key)
           -- for all the other types, we just return the value
           ELSE value
         END
@@ -93,9 +105,6 @@ $$ LANGUAGE SQL;
 -- );
 
 
-CREATE SCHEMA audit;
-REVOKE ALL ON SCHEMA audit FROM public;
-COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
 
 --
 -- Audited data. Lots of information is available, it's just a matter of how
@@ -115,7 +124,8 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 -- useful indexes and do your analysis.
 --
 CREATE TABLE audit.log (
-    id bigserial NOT NULL PRIMARY KEY,
+    id bigserial NOT NULL,
+    tenant_id bigint,
     schema_name text NOT NULL,
     table_name text NOT NULL,
     row_key text,
@@ -127,18 +137,19 @@ CREATE TABLE audit.log (
     transaction_id bigint,
     application_name text,
     application_user text,
-    tenant_id bigint,
     client_addr inet,
     client_port integer,
     client_query text,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
-    original JSONB,
+    original_not_null JSONB,
     diff JSONB,
-    statement_only boolean not null
-);
+    statement_only boolean not null,
+    PRIMARY KEY (id, tenant_id)
+) partition by list(tenant_id);
 
 REVOKE ALL ON audit.log FROM public;
 
+COMMENT ON COLUMN audit.log.tenant_id IS 'Tenant ID set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON TABLE audit.log IS 'History of auditable actions on audited tables, from audit.if_modified_func()';
 COMMENT ON COLUMN audit.log.id IS 'Unique identifier for each auditable event';
 COMMENT ON COLUMN audit.log.schema_name IS 'Database schema audited table for this event is in';
@@ -155,15 +166,14 @@ COMMENT ON COLUMN audit.log.client_port IS 'Remote peer IP port address of clien
 COMMENT ON COLUMN audit.log.client_query IS 'Top-level query that caused this auditable event. May be more than one statement.';
 COMMENT ON COLUMN audit.log.application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.application_user IS 'Application user set when this audit event occurred. Can be changed in-session by client.';
-COMMENT ON COLUMN audit.log.tenant_id IS 'Tenant ID set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
-COMMENT ON COLUMN audit.log.original IS 'Record value. Null for statement-level trigger. For INSERT this tuple is empty. For DELETE and UPDATE it is the old tuple.';
+COMMENT ON COLUMN audit.log.original_not_null IS 'Record value. Null for statement-level trigger. For INSERT this tuple is empty. For DELETE and UPDATE it is the old tuple. Null fields are omitted.';
 COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by INSERT and UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
-CREATE INDEX log_relid_idx ON audit.log(relid);
+-- CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
-CREATE INDEX log_action_idx ON audit.log(action);
+-- CREATE INDEX log_action_idx ON audit.log(action);
 CREATE INDEX log_schema_name_table_name_tenant_row_key_action_tstamp_tx_idx
     ON audit.log (schema_name, table_name, row_key, tenant_id, action_tstamp_tx DESC);
 
@@ -174,14 +184,24 @@ DECLARE
     row_key_col text = 'id';
     jsonb_old JSONB;
     jsonb_new JSONB;
-
+    original JSONB;
+    tenant_id bigint;
+    partition_name text;
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
 
+    -- create partitioned table if it doesn't exist
+    tenant_id = coalesce(current_setting('tenant_id', 't')::bigint, 0);
+    partition_name = 'log_tenant_' || tenant_id;
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'audit' AND tablename = partition_name) THEN
+        EXECUTE 'CREATE TABLE audit.' || partition_name || ' PARTITION OF AUDIT.LOG FOR VALUES IN (' || tenant_id || ')';
+    END IF;
+
     audit_row = ROW(
-        nextval('audit.log_id_seq'),                  -- log ID
+        NULL,                                         -- log ID
+        tenant_id,                                    -- tenant ID
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
         NULL,                                         -- the 'id' column from the NEW row (if it exists)
@@ -193,12 +213,11 @@ BEGIN
         txid_current(),                               -- transaction ID
         current_setting('application.name', 't'),          -- client application
         current_setting('application.user', 't'),          -- client user
-        current_setting('tenant_id', 't'),                 -- tenant ID
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
         substring(TG_OP,1,1),                         -- action
-        NULL,                                         -- original
+        NULL,                                         -- original not null
         NULL,                                         -- diff
         'f'                                           -- statement_only
         );
@@ -221,8 +240,10 @@ BEGIN
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_minus(jsonb_old, excluded_cols);
-        audit_row.diff = jsonb_minus(jsonb_minus(jsonb_new, audit_row.original), excluded_cols);
+        original = audit.jsonb_minus(jsonb_old, excluded_cols);
+        audit_row.diff = audit.jsonb_minus(audit.jsonb_minus(jsonb_new, original), excluded_cols);
+        audit_row.original_not_null = jsonb_strip_nulls(original);
+
         IF audit_row.diff = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
@@ -232,19 +253,21 @@ BEGIN
         IF jsonb_old ? row_key_col THEN
             audit_row.row_key = jsonb_old ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_minus(jsonb_old, excluded_cols);
+        audit_row.original_not_null = audit.jsonb_minus(jsonb_old, excluded_cols);
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         jsonb_new = to_jsonb(NEW.*);
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.diff = jsonb_minus(jsonb_new, excluded_cols);
+        audit_row.diff = audit.jsonb_minus(jsonb_new, excluded_cols);
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
         RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger for unhandled case: %, %',TG_OP, TG_LEVEL;
         RETURN NULL;
     END IF;
+    -- finnaly insert the row into the partitioned table
+    audit_row.id = nextval('audit.log_id_seq');
     INSERT INTO audit.log VALUES (audit_row.*);
     RETURN NULL;
 END;
