@@ -19,7 +19,7 @@
 --    do not recreate minus ("-") operator for json fields
 --
 
-CREATE SCHEMA audit;
+CREATE SCHEMA IF NOT EXISTS audit;
 REVOKE ALL ON SCHEMA audit FROM public;
 COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
 
