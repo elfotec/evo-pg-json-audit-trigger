@@ -10,6 +10,8 @@
 
 --
 -- Elfotec changes: 
+--    https://github.com/elfotec/evo-pg-json-audit-trigger
+--
 --    added tenant_id column to the audit table and to the index.
 --    changed index adding tenant_id column
 --    removed useless indexes
@@ -17,6 +19,8 @@
 --    only logs old not null values
 --    keep all objects only in "audit" schema
 --    do not recreate minus ("-") operator for json fields
+--    renamed application fields (app_user_login, app_user_id, app_application_name)
+--    wrapper FUNCTION audit.audit_table(target_table regclass) does not log client query by default
 --
 
 CREATE SCHEMA IF NOT EXISTS audit;
@@ -25,7 +29,7 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 
 
 --
--- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
+-- Implements "JSONB - keys[]", returns a JSONB document with the keys removed
 --
 --    http://schinckel.net/2014/09/29/adding-json%28b%29-operators-to-postgresql/
 
@@ -43,24 +47,16 @@ CREATE OR REPLACE FUNCTION audit."jsonb_minus"(
 AS $function$
   SELECT
     -- Only executes opration if the JSON document has the keys
-    CASE WHEN "json" ?| "keys"
+    CASE WHEN jsonb_exists_any("json", "keys")
       THEN COALESCE(
           (SELECT ('{' || string_agg(to_json("key")::text || ':' || "value", ',') || '}')
            FROM jsonb_each("json")
-           WHERE "key" <> ALL ("keys")),
+           WHERE "key" != ALL ("keys")),
           '{}'
         )::jsonb
       ELSE "json"
     END
 $function$;
-
--- DROP OPERATOR - (jsonb, text[]);
--- CREATE OPERATOR - (
---   LEFTARG = jsonb,
---   RIGHTARG = text[],
---   PROCEDURE = jsonb_minus
--- );
-
 
 --
 -- Implments "JSONB - JSONB", returns a recursive diff of the JSON documents
@@ -72,8 +68,7 @@ $function$;
 --
 CREATE OR REPLACE FUNCTION audit.jsonb_minus ( arg1 jsonb, arg2 jsonb )
 RETURNS jsonb
-AS $$
-
+AS $function$
   SELECT
     COALESCE(
       json_object_agg(
@@ -92,18 +87,9 @@ AS $$
   FROM
     jsonb_each(arg1)
   WHERE
-    arg1 -> key <> arg2 -> key
+    arg1 -> key != arg2 -> key
     OR arg2 -> key IS NULL
-
-$$ LANGUAGE SQL;
-
--- DROP OPERATOR - (jsonb, jsonb);
--- CREATE OPERATOR - (
---   LEFTARG = jsonb,
---   RIGHTARG = jsonb,
---   PROCEDURE = jsonb_minus
--- );
-
+$function$ LANGUAGE SQL;
 
 
 --
@@ -123,7 +109,7 @@ $$ LANGUAGE SQL;
 -- that you're interested in, into a temporary table where you CREATE any
 -- useful indexes and do your analysis.
 --
-CREATE TABLE audit.log (
+CREATE TABLE IF NOT EXISTS audit.log (
     id bigserial NOT NULL,
     tenant_id bigint,
     schema_name text NOT NULL,
@@ -135,8 +121,9 @@ CREATE TABLE audit.log (
     action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
     action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
     transaction_id bigint,
-    application_name text,
-    application_user text,
+    app_application_name text,
+    app_user_login text,
+    app_user_id bigint,
     client_addr inet,
     client_port integer,
     client_query text,
@@ -149,9 +136,9 @@ CREATE TABLE audit.log (
 
 REVOKE ALL ON audit.log FROM public;
 
-COMMENT ON COLUMN audit.log.tenant_id IS 'Tenant ID set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON TABLE audit.log IS 'History of auditable actions on audited tables, from audit.if_modified_func()';
 COMMENT ON COLUMN audit.log.id IS 'Unique identifier for each auditable event';
+COMMENT ON COLUMN audit.log.tenant_id IS 'Tenant ID set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.schema_name IS 'Database schema audited table for this event is in';
 COMMENT ON COLUMN audit.log.table_name IS 'Non-schema-qualified table name of table event occured in';
 COMMENT ON COLUMN audit.log.relid IS 'Table OID. Changes with drop/create. Get with ''tablename''::regclass';
@@ -164,17 +151,18 @@ COMMENT ON COLUMN audit.log.transaction_id IS 'Identifier of transaction that ma
 COMMENT ON COLUMN audit.log.client_addr IS 'IP address of client that issued query. Null for unix domain socket.';
 COMMENT ON COLUMN audit.log.client_port IS 'Remote peer IP port address of client that issued query. Undefined for unix socket.';
 COMMENT ON COLUMN audit.log.client_query IS 'Top-level query that caused this auditable event. May be more than one statement.';
-COMMENT ON COLUMN audit.log.application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
-COMMENT ON COLUMN audit.log.application_user IS 'Application user set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.app_application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.app_user_login IS 'Application user login set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.app_user_id IS 'Application user id set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
 COMMENT ON COLUMN audit.log.original_not_null IS 'Record value. Null for statement-level trigger. For INSERT this tuple is empty. For DELETE and UPDATE it is the old tuple. Null fields are omitted.';
 COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by INSERT and UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
 -- CREATE INDEX log_relid_idx ON audit.log(relid);
-CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
+CREATE INDEX IF NOT EXISTS log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 -- CREATE INDEX log_action_idx ON audit.log(action);
-CREATE INDEX log_schema_name_table_name_tenant_row_key_action_tstamp_tx_idx
+CREATE INDEX IF NOT EXISTS log_schema_name_table_name_tenant_row_key_action_tstamp_tx_idx
     ON audit.log (schema_name, table_name, row_key, tenant_id, action_tstamp_tx DESC);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
@@ -188,12 +176,12 @@ DECLARE
     tenant_id bigint;
     partition_name text;
 BEGIN
-    IF TG_WHEN <> 'AFTER' THEN
+    IF TG_WHEN != 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
 
     -- create partitioned table if it doesn't exist
-    tenant_id = coalesce(current_setting('tenant_id', 't')::bigint, 0);
+    tenant_id = coalesce(current_setting('app.current_tenant', 't')::bigint, 0);
     partition_name = 'log_tenant_' || tenant_id;
     IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'audit' AND tablename = partition_name) THEN
         EXECUTE 'CREATE TABLE audit.' || partition_name || ' PARTITION OF AUDIT.LOG FOR VALUES IN (' || tenant_id || ')';
@@ -211,8 +199,9 @@ BEGIN
         statement_timestamp(),                        -- action_tstamp_stm
         clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
-        current_setting('application.name', 't'),          -- client application
-        current_setting('application.user', 't'),          -- client user
+        current_setting('app.application_name', 't'), -- app_application_name - client application
+        current_setting('app.user_login', 't')::text, -- app_user_login - client user name
+        current_setting('app.user_id', 't')::bigint,  -- app_user_id - client user id
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
@@ -372,10 +361,10 @@ SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[], NULL);
 $body$ LANGUAGE SQL;
 
 -- And provide a convenience call wrapper for the simplest case
--- of row-level logging with no excluded cols, query logging enabled, and no row key specified.
+-- of row-level logging with no excluded cols, query logging disabled, and no row key specified.
 --
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass) RETURNS void AS $body$
-SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::text[], NULL);
+SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 'f', ARRAY[]::text[], NULL);
 $body$ LANGUAGE 'sql';
 
 -- And provide a convenience call wrapper for case like the simplest, but with a row_key_col specified
