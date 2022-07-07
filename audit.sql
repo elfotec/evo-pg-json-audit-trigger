@@ -1,3 +1,7 @@
+--
+-- Forked from
+--    https://github.com/tekells-usgs/pg-json-audit-trigger
+--
 -- An audit history is important on most tables. Provide an audit trigger that logs to
 -- a dedicated audit table for the major relations.
 --
@@ -124,6 +128,7 @@ CREATE TABLE IF NOT EXISTS audit.log (
     app_application_name text,
     app_user_login text,
     app_user_id bigint,
+    app_request_addr text,
     client_addr inet,
     client_port integer,
     client_query text,
@@ -154,6 +159,7 @@ COMMENT ON COLUMN audit.log.client_query IS 'Top-level query that caused this au
 COMMENT ON COLUMN audit.log.app_application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.app_user_login IS 'Application user login set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.app_user_id IS 'Application user id set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.log.app_request_addr IS 'IP address of original request for the client that issued query.';
 COMMENT ON COLUMN audit.log.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
 COMMENT ON COLUMN audit.log.original_not_null IS 'Record value. Null for statement-level trigger. For INSERT this tuple is empty. For DELETE and UPDATE it is the old tuple. Null fields are omitted.';
 COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by INSERT and UPDATE. Null except for row-level UPDATE events.';
@@ -199,9 +205,10 @@ BEGIN
         statement_timestamp(),                        -- action_tstamp_stm
         clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
-        current_setting('app.application_name', 't'), -- app_application_name - client application
-        current_setting('app.user_login', 't')::text, -- app_user_login - client user name
-        current_setting('app.user_id', 't')::bigint,  -- app_user_id - client user id
+        current_setting('app.application_name', 't'),    -- app_application_name - client application
+        current_setting('app.user_login', 't')::text,    -- app_user_login - client user name
+        current_setting('app.user_id', 't')::bigint,     -- app_user_id - client user id
+        current_setting('app.request_addr', 't')::text,  -- app_request_addr - request IP
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
