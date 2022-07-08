@@ -25,6 +25,12 @@
 --    do not recreate minus ("-") operator for json fields
 --    renamed application fields (app_user_login, app_user_id, app_application_name)
 --    wrapper FUNCTION audit.audit_table(target_table regclass) does not log client query by default
+--    change "session_user" por db_user
+--    droped fields
+--       audit.log.action_tstamp_clk 
+--       audit.log.action_tstamp_stm
+--       audit.client_addr inet,
+--       audit.client_port
 --
 
 CREATE SCHEMA IF NOT EXISTS audit;
@@ -120,17 +126,17 @@ CREATE TABLE IF NOT EXISTS audit.log (
     table_name text NOT NULL,
     row_key text,
     relid oid NOT NULL,
-    "session_user" text NOT NULL,
+    db_user text NOT NULL,
     action_tstamp_tx TIMESTAMP WITH TIME ZONE NOT NULL,
-    action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
-    action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
+    -- action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
+    -- action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
     transaction_id bigint,
     app_application_name text,
     app_user_login text,
     app_user_id bigint,
     app_request_addr text,
-    client_addr inet,
-    client_port integer,
+    -- client_addr inet,
+    -- client_port integer,
     client_query text,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     original_not_null JSONB,
@@ -148,13 +154,13 @@ COMMENT ON COLUMN audit.log.schema_name IS 'Database schema audited table for th
 COMMENT ON COLUMN audit.log.table_name IS 'Non-schema-qualified table name of table event occured in';
 COMMENT ON COLUMN audit.log.relid IS 'Table OID. Changes with drop/create. Get with ''tablename''::regclass';
 COMMENT ON COLUMN audit.log.row_key IS 'Key for the row in the audited table, by default, this is the value from the ''id'' column converted to text';
-COMMENT ON COLUMN audit.log.session_user IS 'Login / session user whose statement caused the audited event';
+COMMENT ON COLUMN audit.log.db_user IS 'Login / session user whose statement caused the audited event';
 COMMENT ON COLUMN audit.log.action_tstamp_tx IS 'Transaction start timestamp for tx in which audited event occurred';
-COMMENT ON COLUMN audit.log.action_tstamp_stm IS 'Statement start timestamp for tx in which audited event occurred';
-COMMENT ON COLUMN audit.log.action_tstamp_clk IS 'Wall clock time at which audited event''s trigger call occurred';
+-- COMMENT ON COLUMN audit.log.action_tstamp_stm IS 'Statement start timestamp for tx in which audited event occurred';
+-- COMMENT ON COLUMN audit.log.action_tstamp_clk IS 'Wall clock time at which audited event''s trigger call occurred';
 COMMENT ON COLUMN audit.log.transaction_id IS 'Identifier of transaction that made the change. May wrap, but unique paired with action_tstamp_tx.';
-COMMENT ON COLUMN audit.log.client_addr IS 'IP address of client that issued query. Null for unix domain socket.';
-COMMENT ON COLUMN audit.log.client_port IS 'Remote peer IP port address of client that issued query. Undefined for unix socket.';
+-- COMMENT ON COLUMN audit.log.client_addr IS 'IP address of client that issued query. Null for unix domain socket.';
+-- COMMENT ON COLUMN audit.log.client_port IS 'Remote peer IP port address of client that issued query. Undefined for unix socket.';
 COMMENT ON COLUMN audit.log.client_query IS 'Top-level query that caused this auditable event. May be more than one statement.';
 COMMENT ON COLUMN audit.log.app_application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
 COMMENT ON COLUMN audit.log.app_user_login IS 'Application user login set when this audit event occurred. Can be changed in-session by client.';
@@ -166,10 +172,10 @@ COMMENT ON COLUMN audit.log.diff IS 'New values of fields changed by INSERT and 
 COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
 -- CREATE INDEX log_relid_idx ON audit.log(relid);
-CREATE INDEX IF NOT EXISTS log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
+CREATE INDEX IF NOT EXISTS log_action_tstamp_tx_idx ON audit.log(action_tstamp_tx);
 -- CREATE INDEX log_action_idx ON audit.log(action);
-CREATE INDEX IF NOT EXISTS log_schema_name_table_name_tenant_row_key_action_tstamp_tx_idx
-    ON audit.log (schema_name, table_name, row_key, tenant_id, action_tstamp_tx DESC);
+CREATE INDEX IF NOT EXISTS log_tenant_schema_name_table_name_row_key_action_tstamp_tx_idx
+    ON audit.log (tenant_id, schema_name, table_name, row_key, action_tstamp_tx DESC);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
@@ -200,17 +206,17 @@ BEGIN
         TG_TABLE_NAME::text,                          -- table_name
         NULL,                                         -- the 'id' column from the NEW row (if it exists)
         TG_RELID,                                     -- relation OID for much quicker searches
-        session_user::text,                           -- session_user
+        session_user::text,                           -- db_user
         current_timestamp,                            -- action_tstamp_tx
-        statement_timestamp(),                        -- action_tstamp_stm
-        clock_timestamp(),                            -- action_tstamp_clk
+        -- statement_timestamp(),                        -- action_tstamp_stm
+        -- clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
         current_setting('app.application_name', 't'),    -- app_application_name - client application
         current_setting('app.user_login', 't')::text,    -- app_user_login - client user name
         current_setting('app.user_id', 't')::bigint,     -- app_user_id - client user id
         current_setting('app.request_addr', 't')::text,  -- app_request_addr - request IP
-        inet_client_addr(),                           -- client_addr
-        inet_client_port(),                           -- client_port
+        -- inet_client_addr(),                           -- client_addr
+        -- inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
         substring(TG_OP,1,1),                         -- action
         NULL,                                         -- original not null
