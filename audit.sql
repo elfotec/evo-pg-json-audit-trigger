@@ -35,6 +35,7 @@
 
 CREATE SCHEMA IF NOT EXISTS audit;
 REVOKE ALL ON SCHEMA audit FROM public;
+ALTER schema audit OWNER TO postgres;
 COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
 
 
