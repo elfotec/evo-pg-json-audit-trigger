@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS audit.log (
     -- client_addr inet,
     -- client_port integer,
     client_query text,
-    action TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     original_not_null JSONB,
     diff JSONB,
     statement_only boolean not null,
