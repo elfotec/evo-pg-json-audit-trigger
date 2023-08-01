@@ -193,6 +193,16 @@ BEGIN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
 
+
+    IF current_setting('app.no_audit') IS NOT NULL AND current_setting('app.no_audit')::int = current_setting('app.current_tenant', 't')::int THEN
+        -- Se a variável de sessão estiver definida e for igual ao tenant_id, ignorar a ação de auditoria
+        RETURN NULL;
+    END IF;
+  EXCEPTION
+    WHEN undefined_object THEN
+        -- Caso a variável de sessão 'app.no_audit' não exista, seguir...
+
+
     -- create partitioned table if it doesn't exist
     tenant_id = coalesce(current_setting('app.current_tenant', 't')::bigint, 0);
     partition_name = 'log_tenant_' || tenant_id;
