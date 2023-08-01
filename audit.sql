@@ -195,7 +195,7 @@ BEGIN
     END IF;
 
     tenant_id = coalesce(current_setting('app.current_tenant', 't')::bigint, 0);
-    no_audit_tenant_id = current_setting('app.no_audit_tenant_id', 't')::bigint;
+    no_audit_tenant_id = current_setting('app.no_audit_tenant', 't')::bigint;
 
     -- Se a variável de sessão estiver definida e for igual ao tenant_id, ignorar a ação de auditoria
     IF no_audit_tenant_id IS NOT NULL AND no_audit_tenant_id = tenant_id THEN
