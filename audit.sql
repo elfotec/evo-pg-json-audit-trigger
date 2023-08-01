@@ -187,24 +187,22 @@ DECLARE
     jsonb_new JSONB;
     original JSONB;
     tenant_id bigint;
+    no_audit_tenant_id bigint;
     partition_name text;
 BEGIN
     IF TG_WHEN != 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
 
+    tenant_id = coalesce(current_setting('app.current_tenant', 't')::bigint, 0);
+    no_audit_tenant_id = current_setting('app.no_audit_tenant_id', 't')::bigint;
 
-    IF current_setting('app.no_audit') IS NOT NULL AND current_setting('app.no_audit')::int = current_setting('app.current_tenant', 't')::int THEN
-        -- Se a variável de sessão estiver definida e for igual ao tenant_id, ignorar a ação de auditoria
+    -- Se a variável de sessão estiver definida e for igual ao tenant_id, ignorar a ação de auditoria
+    IF no_audit_tenant_id IS NOT NULL AND no_audit_tenant_id = tenant_id THEN
         RETURN NULL;
     END IF;
-  EXCEPTION
-    WHEN undefined_object THEN
-        -- Caso a variável de sessão 'app.no_audit' não exista, seguir...
-
 
     -- create partitioned table if it doesn't exist
-    tenant_id = coalesce(current_setting('app.current_tenant', 't')::bigint, 0);
     partition_name = 'log_tenant_' || tenant_id;
     IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'audit' AND tablename = partition_name) THEN
         EXECUTE 'CREATE TABLE audit.' || partition_name || ' PARTITION OF AUDIT.LOG FOR VALUES IN (' || tenant_id || ')';
