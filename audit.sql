@@ -221,7 +221,10 @@ BEGIN
         -- clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
         current_setting('app.application_name', 't'),    -- app_application_name - client application
-        current_setting('app.user_login', 't')::text,    -- app_user_login - client user name
+        case 
+            when trim(current_setting('app.user_login', 't')::text) = '' then null
+            else current_setting('app.user_login', 't')::text
+        end,    -- app_user_login - client user name
         current_setting('app.user_id', 't')::bigint,     -- app_user_id - client user id
         current_setting('app.request_addr', 't')::text,  -- app_request_addr - request IP
         -- inet_client_addr(),                           -- client_addr
