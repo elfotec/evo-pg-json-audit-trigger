@@ -1,2 +1,2 @@
-FROM postgres:16.8
+FROM postgres:16.9
 ADD audit.sql /docker-entrypoint-initdb.d/
