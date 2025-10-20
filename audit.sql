@@ -22,7 +22,7 @@
 --    added partition by tenant_id for log table 
 --    only logs old not null values
 --    keep all objects only in "audit" schema
---    do not recreate minus ("-") operator for json fields
+--    use PostgreSQL 17 native jsonb - text[] operator instead of custom functions
 --    renamed application fields (app_user_login, app_user_id, app_application_name)
 --    wrapper FUNCTION audit.audit_table(target_table regclass) does not log client query by default
 --    change "session_user" por db_user
@@ -40,37 +40,14 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 
 
 --
--- Implements "JSONB - keys[]", returns a JSONB document with the keys removed
---
---    http://schinckel.net/2014/09/29/adding-json%28b%29-operators-to-postgresql/
-
--- param 0: JSONB, source JSONB document to remove keys from
--- param 1: text[], keys to remove from the JSONB document
---
-CREATE OR REPLACE FUNCTION audit."jsonb_minus"(
-  "json" jsonb,
-  "keys" TEXT[]
-)
-  RETURNS jsonb
-  LANGUAGE sql
-  IMMUTABLE
-  STRICT
-AS $function$
-  SELECT
-    -- Only executes opration if the JSON document has the keys
-    CASE WHEN jsonb_exists_any("json", "keys")
-      THEN COALESCE(
-          (SELECT ('{' || string_agg(to_json("key")::text || ':' || "value", ',') || '}')
-           FROM jsonb_each("json")
-           WHERE "key" != ALL ("keys")),
-          '{}'
-        )::jsonb
-      ELSE "json"
-    END
-$function$;
-
---
--- Implments "JSONB - JSONB", returns a recursive diff of the JSON documents
+-- Implements "JSONB - JSONB", returns a recursive diff of the JSON documents
+-- 
+-- Note: PostgreSQL 17 does not have a native operator for JSONB - JSONB recursive diff,
+-- so this custom function is still required for audit functionality. However, this version
+-- has been optimized to use PostgreSQL 17 features:
+-- - Uses jsonb_object_agg instead of json_object_agg + cast
+-- - Uses IS DISTINCT FROM for better NULL handling
+-- - Added IMMUTABLE STRICT for better performance
 --
 -- http://coussej.github.io/2016/05/24/A-Minus-Operator-For-PostgreSQLs-JSONB/
 --
@@ -82,7 +59,7 @@ RETURNS jsonb
 AS $function$
   SELECT
     COALESCE(
-      json_object_agg(
+      jsonb_object_agg(
         key,
         CASE
           -- if the value is an object and the value of the second argument is
@@ -93,14 +70,13 @@ AS $function$
           ELSE value
         END
       ),
-    '{}'
-    )::jsonb
+      '{}'::jsonb
+    )
   FROM
     jsonb_each(arg1)
   WHERE
-    arg1 -> key != arg2 -> key
-    OR arg2 -> key IS NULL
-$function$ LANGUAGE SQL;
+    arg1 -> key IS DISTINCT FROM arg2 -> key
+$function$ LANGUAGE SQL IMMUTABLE STRICT;
 
 
 --
@@ -209,7 +185,7 @@ BEGIN
     END IF;
 
     audit_row = ROW(
-        NULL,                                         -- log ID
+        NULL,                                         -- log ID 
         tenant_id,                                    -- tenant ID
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
@@ -219,7 +195,7 @@ BEGIN
         current_timestamp,                            -- action_tstamp_tx
         -- statement_timestamp(),                        -- action_tstamp_stm
         -- clock_timestamp(),                            -- action_tstamp_clk
-        txid_current(),                               -- transaction ID
+        pg_current_xact_id(),                            -- transaction ID
         current_setting('app.application_name', 't'),    -- app_application_name - client application
         case 
             when trim(current_setting('app.user_login', 't')::text) = '' then null
@@ -254,8 +230,8 @@ BEGIN
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        original = audit.jsonb_minus(jsonb_old, excluded_cols);
-        audit_row.diff = audit.jsonb_minus(audit.jsonb_minus(jsonb_new, original), excluded_cols);
+        original = jsonb_old - excluded_cols;
+        audit_row.diff = (audit.jsonb_minus(jsonb_new, original) - excluded_cols);
         audit_row.original_not_null = jsonb_strip_nulls(original);
 
         IF audit_row.diff = '{}'::jsonb THEN
@@ -267,13 +243,13 @@ BEGIN
         IF jsonb_old ? row_key_col THEN
             audit_row.row_key = jsonb_old ->> row_key_col;
         END IF;
-        audit_row.original_not_null = audit.jsonb_minus(jsonb_old, excluded_cols);
+        audit_row.original_not_null = jsonb_old - excluded_cols;
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         jsonb_new = to_jsonb(NEW.*);
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.diff = audit.jsonb_minus(jsonb_new, excluded_cols);
+        audit_row.diff = jsonb_new - excluded_cols;
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
@@ -350,7 +326,7 @@ BEGIN
         END IF;
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' ||
                  target_table::TEXT ||
-                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
+                 ' FOR EACH ROW EXECUTE FUNCTION audit.if_modified_func(' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || _row_key_col_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
@@ -360,7 +336,7 @@ BEGIN
 
     _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
              target_table ||
-             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func('||
+             ' FOR EACH STATEMENT EXECUTE FUNCTION audit.if_modified_func('||
              quote_literal(audit_query_text) || ');';
     RAISE NOTICE '%',_q_txt;
     EXECUTE _q_txt;
